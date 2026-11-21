@@ -1,4 +1,4 @@
-"""How much neighbor quality smaller vector formats would cost, measured against float32 search."""
+"""How much neighbor quality smaller vector formats would cost, measured against the stored vectors."""
 from __future__ import annotations
 
 import numpy as np
@@ -17,7 +17,10 @@ def _recall(found: np.ndarray, truth: np.ndarray) -> float:
 
 
 def compare_formats(index: Index, samples: int = 300, k: int = 20, seed: int = 0) -> dict:
-    """Recall of each format's top-k neighbors against exact float32 top-k, per aspect, with its size."""
+    """Recall of each format's top-k neighbors against the stored vectors' top-k, per aspect, with its size.
+
+    The index already stores float16, so that is the baseline; float32 originals are not kept.
+    """
     k = max(1, min(k, index.size - 1))
     rows = np.random.default_rng(seed).choice(index.size, min(samples, index.size), replace=False)
     report = {"titles": index.size, "samples": int(len(rows)), "k": k, "aspects": {}}
@@ -25,12 +28,11 @@ def compare_formats(index: Index, samples: int = 300, k: int = 20, seed: int = 0
         exact = index.dense32(aspect)
         width = exact.shape[1]
         truth = _neighbors(exact[rows] @ exact.T, rows, k)
-        half = exact.astype(np.float16).astype(np.float32)
         scale = float(np.abs(exact).max()) or 1.0
         int8 = np.round(exact / scale * 127).astype(np.int8).astype(np.float32)
         signs = np.where(exact >= 0, 1.0, -1.0).astype(np.float32)
-        formats = {"float16": (half, 2 * width), "int8": (int8, width), "binary": (signs, (width + 7) // 8)}
-        entry = {"float32": {"recall": 1.0, "megabytes": round(index.size * 4 * width / 1e6, 2)}}
+        formats = {"int8": (int8, width), "binary": (signs, (width + 7) // 8)}
+        entry = {"float16 (stored)": {"recall": 1.0, "megabytes": round(index.size * 2 * width / 1e6, 2)}}
         for name, (matrix, bytes_per_row) in formats.items():
             entry[name] = {"recall": round(_recall(_neighbors(matrix[rows] @ matrix.T, rows, k), truth), 4),
                            "megabytes": round(index.size * bytes_per_row / 1e6, 2)}

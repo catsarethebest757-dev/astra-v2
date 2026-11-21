@@ -215,6 +215,12 @@ class SyntheticTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.clusters(payload)[0], 1)
 
+    def test_query_words_only_credit_real_matches(self):
+        payload = self.engine.recommend({"query": "word6", "limit": 12, "explain": True})
+        for item in payload["results"]:
+            if "query words" in item["inspect"]["found_by"]:
+                self.assertIn("word6", self.index.records[self.index.ids[item["id"]]]["synopsis"])
+
     def test_inspector_accounts_for_the_score(self):
         plain = self.engine.recommend({"liked": [self.ids[30]], "limit": 5})
         self.assertNotIn("inspect", plain["results"][0])
@@ -236,7 +242,7 @@ class SyntheticTests(unittest.TestCase):
     def test_format_comparison(self):
         report = compare_formats(self.index, samples=40, k=10)
         whole = report["aspects"]["whole"]
-        self.assertGreater(whole["float16"]["recall"], 0.95)
+        self.assertEqual(whole["float16 (stored)"]["recall"], 1.0)
         self.assertGreaterEqual(whole["int8"]["recall"], whole["binary"]["recall"])
         self.assertLess(whole["binary"]["megabytes"], whole["int8"]["megabytes"])
 

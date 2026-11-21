@@ -18,11 +18,11 @@ python -m astranami prepare-serve                      # build whatever is missi
 python -m astranami search "cowboy bebop"              # find a title id
 python -m astranami similar --id anime:al:1 --explain  # rank similar titles with a score breakdown
 python -m astranami similar --id anime:al:1 --id anime:al:5114 --query "slow melancholy mystery"
-python -m astranami compare-index                      # what float16, int8, and binary vectors would cost
+python -m astranami compare-index                      # what int8 and binary vectors would cost
 ```
 
 Liking several titles gives each one a fair share of the list, so one outlying like is not crowded out by a group of similar likes. Each result names the liked title it matches best.
 
 Tick "Show why each title ranked" in the UI, pass `--explain` on the command line, or send `"explain": true` to `/api/recommend` to see, per result: which retrieval views found it, how the score splits into taste, query, agreement, quality, and dislike parts, its score against each liked title, and its strongest features.
 
-`compare-index` reports, for each embedding aspect, how many exact nearest neighbors survive in float16, int8, binary, and binary-with-int8-rescoring formats, next to the size of each.
+`compare-index` reports, for each embedding aspect, how many of the stored float16 vectors' nearest neighbors survive in int8, binary, and binary-with-int8-rescoring formats, next to the size of each.
