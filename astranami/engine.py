@@ -272,7 +272,8 @@ class Engine:
             for name, rows in candidate_channels(self.index, seed, mask, sizes=POOL_SIZES).items():
                 channels[name].append(rows)
         if query:
-            channels["query words"].append(top_k(lexical, 200, mask))
+            worded = top_k(lexical, 200, mask)
+            channels["query words"].append(worded[lexical[worded] > 0])
             if qvec is not None:
                 for aspect, count in (("whole", 200), ("themes", 80), ("tone", 40)):
                     channels[f"query {aspect}"].append(top_k(dense_scores(self.index, aspect, qvec), count, mask))
