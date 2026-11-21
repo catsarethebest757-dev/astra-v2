@@ -1,10 +1,11 @@
-"""Command line: bootstrap, build, train, evaluate, serve, similar, search, compare-index, self-test."""
+"""Command line: bootstrap, import, build, train, evaluate, benchmark, serve, similar, search, compare-index, self-test."""
 from __future__ import annotations
 
 import argparse
 import json
 import sys
 import unittest
+from pathlib import Path
 
 from .compare import compare_formats
 from .config import DATA_DIR, BuildConfig
@@ -62,6 +63,18 @@ def main(argv: list[str] | None = None) -> int:
     compare.add_argument("--samples", type=int, default=300)
     compare.add_argument("--k", type=int, default=20)
 
+    importer = commands.add_parser("import", parents=[common],
+                                   help="Build the catalog and index from exported titles and vectors")
+    importer.add_argument("--titles", required=True, help="Title records as .jsonl or .jsonl.gz")
+    importer.add_argument("--keys", required=True, help="JSON list of title ids, one per vector row")
+    importer.add_argument("--vectors", required=True, help=".npy matrix of title vectors")
+    importer.add_argument("--training", help="Folder with titles.jsonl and pairs.jsonl (families, recommendations)")
+
+    bench = commands.add_parser("benchmark", parents=[common],
+                                help="Score the engine and baselines against a judged file")
+    bench.add_argument("file", help='JSON: {"group": [{"seed": id, "relevant": [ids]}], "pools": {"group": [ids]}}')
+    bench.add_argument("--limit", type=int, help="Use only the first N seeds of each group")
+
     commands.add_parser("self-test", parents=[common], help="Run the unit tests")
 
     args = parser.parse_args(argv)
@@ -92,6 +105,16 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
     elif args.command == "compare-index":
         payload = compare_formats(load_engine(directory).index, samples=args.samples, k=args.k)
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, allow_nan=False)
+        sys.stdout.write("\n")
+    elif args.command == "import":
+        from .importer import import_catalog
+        import_catalog(directory, Path(args.titles), Path(args.keys), Path(args.vectors),
+                       Path(args.training) if args.training else None)
+    elif args.command == "benchmark":
+        from .benchmark import benchmark_file
+        engine = load_engine(directory)
+        payload = benchmark_file(engine.index, Path(args.file), ranker=engine.ranker, limit=args.limit)
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, allow_nan=False)
         sys.stdout.write("\n")
     elif args.command == "self-test":

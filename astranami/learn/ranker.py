@@ -14,9 +14,8 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..index import Index
-from ..learn.features import FEATURES, GRAPH_FEATURES, candidate_pool, pair_features
+from ..learn.features import FEATURES, GRAPH_FEATURES, pair_features
 from ..learn.pairs import adjacency, relevant
-from ..learn.retrieve import batch_neighbors
 from ..util import log
 
 
@@ -39,6 +38,12 @@ HEURISTIC[FEATURES.index("graph_direct")] = 0.18
 HEURISTIC[FEATURES.index("graph_2hop")] = 0.08
 HEURISTIC[FEATURES.index("graph_spectral")] = 0.05
 HEURISTIC[FEATURES.index("cand_quality")] = 0.04
+
+
+# Only titles with fan recommendations can be a training positive, and those are the popular, well
+# documented ones. A ranker that sees these columns learns "popular means relevant" and then buries
+# the obscure titles it is asked about; the engine applies popularity and quality as explicit priors.
+SELECTION_BIASED = ("has_graph", "cand_pop", "cand_quality", "seed_pop", "cand_has_synopsis", "source_match")
 
 
 def heuristic_scores(features: np.ndarray) -> np.ndarray:
@@ -69,20 +74,23 @@ def _ndcg(scores: np.ndarray, gains: np.ndarray) -> float:
 
 
 class RankerNet(nn.Module):
-    def __init__(self, input_dim: int, hidden: int = 128, dropout: float = 0.1):
+    """Small on purpose: a few thousand sparse lists overfit anything larger."""
+
+    def __init__(self, input_dim: int, hidden: int = 32, dropout: float = 0.2):
         super().__init__()
         self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, hidden // 2),
-            nn.GELU(),
-            nn.Linear(hidden // 2, 1),
+            nn.Linear(hidden, 1),
         )
+        keep = torch.ones(input_dim)
+        if input_dim == len(FEATURES):
+            keep[[FEATURES.index(name) for name in SELECTION_BIASED]] = 0
+        self.register_buffer("keep", keep)
 
     def forward(self, features):
-        return self.net(features).squeeze(-1)
+        return self.net(features * self.keep).squeeze(-1)
 
 
 class Ranker:
@@ -126,51 +134,34 @@ def _training_lists(index: Index, seeds: np.ndarray, label_edges: dict, list_siz
         seeds = np.sort(rng.choice(seeds, 2500, replace=False))
     progress(f"Ranker: preparing training lists for {len(seeds):,} seeds")
     graph = adjacency(label_edges)
-    adapter_nn = batch_neighbors(index.adapter, seeds, 80, progress, "adapter") if index.adapter is not None else None
-    whole_nn = batch_neighbors(np.asarray(index.aspects["whole"], dtype=np.float32), seeds, 40,
-                               progress, "whole")
-    theme_nn = batch_neighbors(np.asarray(index.aspects["themes"], dtype=np.float32), seeds, 30,
-                               progress, "themes")
     lists = []
     for row, item in enumerate(seeds):
         item = int(item)
         grades = relevant(index, item, graph.get(item, {}))
         if not grades:
             continue
-        pools = [whole_nn[row], theme_nn[row]]
-        if adapter_nn is not None:
-            pools.append(adapter_nn[row])
-        if index.graph is not None:
-            pools.append(index.graph.neighbors(item, 40))
-        pools.append(np.array(list(grades), dtype=np.int64))
-        candidates = np.unique(np.concatenate(pools))
-        keep = candidates[(index.franchise[candidates] != index.franchise[item]) & ~index.adult[candidates]]
-        keep = keep[keep != item]
-        if len(keep) < 2 or not any(int(value) in grades for value in keep):
-            fallback = candidate_pool(index, item, ~index.adult, use_graph=index.graph is not None)
-            keep = np.unique(np.concatenate([keep, fallback, np.array(list(grades), dtype=np.int64)]))
-            keep = keep[(index.franchise[keep] != index.franchise[item]) & ~index.adult[keep]]
-            keep = keep[keep != item]
-        if len(keep) < 2:
+        def usable(values):
+            values = np.unique(np.asarray(values, dtype=np.int64))
+            values = values[(index.franchise[values] != index.franchise[item]) & ~index.adult[values]]
+            return values[[int(value) not in grades for value in values]]
+
+        positive = rng.permutation(np.array(list(grades), dtype=np.int64))[:list_size // 2]
+        room = list_size - len(positive)
+        # Fan recommendations are sparse, so a close neighbor without one is usually a good match nobody
+        # has written down yet. Lists built from near neighbors teach the ranker that similarity is a bad
+        # sign (measured on a 118k-title catalog), so every negative is a random title.
+        negative = usable(rng.integers(0, index.size, size=room * 2))[:room]
+        if not len(negative):
             continue
+        keep = np.concatenate([positive, negative])
         gains = np.array([grades.get(int(value), 0.0) for value in keep], dtype=np.float32)
-        positive = np.flatnonzero(gains > 0)
-        negative = np.flatnonzero(gains == 0)
-        if len(keep) > list_size:
-            room = max(list_size - len(positive), 0)
-            chosen_neg = negative[:room] if room else negative[:1]
-            if len(negative) > room:
-                hardness = heuristic_scores(pair_features(index, item, keep[negative]))
-                chosen_neg = negative[np.argsort(-hardness)[:room]]
-            selected = np.concatenate([positive[:list_size - 1], chosen_neg])[:list_size]
-            keep, gains = keep[selected], gains[selected]
         lists.append((pair_features(index, item, keep), gains))
         if (row + 1) % 100 == 0 or row + 1 == len(seeds):
             progress(f"Ranker: built lists for {row + 1:,}/{len(seeds):,} seeds")
     return lists
 
 
-def train_ranker(index: Index, seeds: np.ndarray, edges: dict, epochs: int = 30, list_size: int = 48,
+def train_ranker(index: Index, seeds: np.ndarray, edges: dict, epochs: int = 30, list_size: int = 200,
                  seed: int = 13, graph_dropout: float = 0.5, progress=log,
                  label_edges: dict | None = None) -> Ranker:
     torch.manual_seed(seed)
@@ -227,10 +218,16 @@ def train_ranker(index: Index, seeds: np.ndarray, edges: dict, epochs: int = 30,
         model.eval()
         with torch.no_grad():
             checked = [validation[i] for i in range(0, len(validation), max(1, len(validation) // 32))]
-            score = float(np.mean([
-                _ndcg(model((torch.from_numpy(features).to(device) - mean_t) / std_t).cpu().numpy(), gains)
-                for features, gains in checked
-            ])) if checked else -total / max(len(training), 1)
+            # Judge each list with and without its graph features, so the checkpoint that is kept is
+            # also good for titles nobody has recommended yet.
+            scores = []
+            for features, gains in checked:
+                inputs = (torch.from_numpy(features).to(device) - mean_t) / std_t
+                masked = inputs.clone()
+                masked[:, graph_cols] = missing_graph
+                scores.append(0.5 * (_ndcg(model(inputs).cpu().numpy(), gains)
+                                     + _ndcg(model(masked).cpu().numpy(), gains)))
+            score = float(np.mean(scores)) if scores else -total / max(len(training), 1)
         progress(f"Ranker: epoch {epoch + 1}/{epochs} complete, loss {total / max(len(training), 1):.4f}, validation nDCG {score:.4f}")
         if score > best_score + 1e-4:
             best_score = score
@@ -261,5 +258,8 @@ def load_ranker(path: Path) -> Ranker:
     data = np.load(path, allow_pickle=False)
     model = RankerNet(len(FEATURES))
     state = {key.replace("__", "."): torch.from_numpy(data[key]) for key in data.files if not key.startswith("__")}
-    model.load_state_dict(state)
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as error:
+        raise ValueError("This ranker was saved by an older version; run `python -m astranami train` again.") from error
     return Ranker(model, data["__mean"], data["__std"])
