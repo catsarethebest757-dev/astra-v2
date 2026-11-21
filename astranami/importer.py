@@ -13,6 +13,7 @@ from __future__ import annotations
 import gzip
 import json
 import re
+import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from .catalog import blank, clean_edges, cluster_franchises, derive_priors, vali
 from .features.text import MOOD_TAGS, _era, _length
 from .index import Index
 from .store import save_json
-from .util import atomic_json, log, sha, tokens, unit
+from .util import atomic_json, log, norm, sha, tokens, unit
 
 MEDIA = {"anime": "anime", "series": "tv", "tv": "tv", "movie": "movie", "film": "movie"}
 NOTE_LINES = {"World rules": "world", "Appeal": "appeal", "Tone": "tone", "Story themes": "story_themes",
@@ -48,6 +49,12 @@ def canonical(key: str) -> str:
     return key[5:] if key.startswith("film:") else key
 
 
+def _url(source: str, number: str, kind: str) -> str:
+    if source == "tmdb" and kind == "tv":
+        return f"https://www.themoviedb.org/tv/{number}"
+    return SOURCE_URL[source].format(number) if source in SOURCE_URL else ""
+
+
 def _record(row: dict) -> dict:
     identifier = row["id"]
     source, _, number = identifier.partition(":")
@@ -55,13 +62,15 @@ def _record(row: dict) -> dict:
     score = float(row.get("score") or 0)
     return blank(
         identifier, row["name"], MEDIA[row["media"]], aliases=names, year=int(row.get("year") or 0),
-        synopsis=row.get("synopsis") or "", genres=list(row.get("genres") or []),
-        tags={name: float(min(max(weight, 0.0), 1.0)) for name, weight in (row.get("tags") or {}).items()},
+        synopsis=row.get("synopsis") or "",
+        genres=sorted({norm(genre) for genre in row.get("genres") or [] if norm(genre)}),
+        tags={norm(name): float(min(max(weight, 0.0), 1.0)) for name, weight in (row.get("tags") or {}).items()
+              if norm(name)},
         studios=list(row.get("studios") or []), source=source, format=(row.get("format") or "").upper(),
         episodes=int(row.get("episodes") or 0), runtime=int(row.get("runtime") or 0),
         country=row.get("country") or "", language=row.get("language") or "",
         rating=round(min(max(score / 10, 0.0), 10.0), 2), popularity=max(int(row.get("popularity") or 0), 0),
-        image=row.get("image") or "", url=SOURCE_URL[source].format(number) if source in SOURCE_URL else "",
+        image=row.get("image") or "", url=_url(source, number, MEDIA[row["media"]]),
     )
 
 
@@ -169,7 +178,8 @@ def import_catalog(directory: Path, titles: Path, keys: Path, vectors: Path, tra
     documents = [aspect_documents(record) for record in records]
     for aspect in ("plot", "themes", "tone"):
         progress(f"Import: computing the {aspect} aspect")
-        index.aspects[aspect] = latent_vectors([document[aspect] for document in documents])
+        # Same width as the supplied vectors: the taste adapter treats its input as four equal blocks.
+        index.aspects[aspect] = latent_vectors([document[aspect] for document in documents], whole.shape[1])
     index.build_sparse()
     index.set_graph(index.all_edges())
     progress("Import: saving the catalog and index")
@@ -180,6 +190,9 @@ def import_catalog(directory: Path, titles: Path, keys: Path, vectors: Path, tra
         "franchises": len({record["franchise"] for record in records}),
         "imported": True, **stats,
     })
+    # Models trained on whatever catalog was here before describe different titles.
+    (directory / "index" / "adapter.npy").unlink(missing_ok=True)
+    shutil.rmtree(directory / "model", ignore_errors=True)
     index.save(directory / "index")
     save_json(directory / "index", "meta", {"encoder": "imported", "catalog": sha("\n".join(r["id"] for r in records))})
     progress(f"Import: saved {index.size:,} titles.")

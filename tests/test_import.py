@@ -28,11 +28,12 @@ def export(folder: Path, clusters: int = 6, per_cluster: int = 12, width: int = 
             titles.append({
                 "id": identifier, "media": "anime" if cluster % 2 else "movie", "name": f"Title {cluster}-{member}",
                 "year": 2000 + member, "format": "TV", "genres": [f"genre{cluster}"],
-                "tags": {own[0]: 0.9, own[1]: 0.6}, "synopsis": " ".join(own * 3) + f" unique{member}",
+                "tags": {own[0].upper(): 0.9, own[1]: 0.6}, "synopsis": " ".join(own * 3) + f" unique{member}",
                 "score": 60 + member, "popularity": 100 * (member + 1), "episodes": 12,
             })
             keys.append(identifier)
             vectors.append(centers[cluster] + 0.3 * rng.normal(size=width))
+    titles[0]["media"] = "series"
     titles.append({"id": "tmdb:9999", "media": "movie", "name": "No Vector"})
     matrix = np.asarray(vectors, dtype=np.float32)
     matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
@@ -59,7 +60,15 @@ class ImportTests(unittest.TestCase):
             quiet = lambda message: None
             built = import_catalog(data, folder / "titles.jsonl", folder / "keys.json", folder / "vectors.npy",
                                    folder / "training", progress=quiet)
+            (data / "model").mkdir(parents=True)
+            (data / "model" / "ranker.npz").write_bytes(b"stale")
+            built = import_catalog(data, folder / "titles.jsonl", folder / "keys.json", folder / "vectors.npy",
+                                   folder / "training", progress=quiet)
+            self.assertFalse((data / "model").exists())
             self.assertEqual(built.size, len(made["keys"]))
+            self.assertEqual(built.records[built.ids["tmdb:0"]]["url"], "https://www.themoviedb.org/tv/0")
+            self.assertIn("word0", built.records[built.ids["tmdb:1"]]["tags"])
+            self.assertEqual(len({built.aspects[aspect].shape[1] for aspect in built.aspects}), 1)
             index = Index.load(load_json(data, "catalog"), data / "index")
             self.assertEqual(index.size, built.size)
             self.assertNotIn("tmdb:9999", index.ids)
@@ -81,6 +90,20 @@ class ImportTests(unittest.TestCase):
             self.assertEqual(report["movies"]["seeds"], 1)
             self.assertGreater(report["movies"]["whole"]["recall@10"], 0.8)
             self.assertGreater(report["movies"]["heuristic"]["ndcg@10"], 0.5)
+
+    def test_import_without_pairs_still_serves(self):
+        from astranami.pipeline import prepare
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            export(folder)
+            quiet = lambda message: None
+            import_catalog(folder / "data", folder / "titles.jsonl", folder / "keys.json", folder / "vectors.npy",
+                           progress=quiet)
+            engine = prepare(folder / "data", progress=quiet)
+            self.assertIsNone(engine.ranker)
+            results = engine.recommend({"liked": ["tmdb:1"], "exclude_tags": ["WORD1"], "limit": 5})["results"]
+            self.assertTrue(results)
+            self.assertTrue(all("word1" not in item["tags"] for item in results))
 
     def test_training_negatives_are_not_near_neighbors(self):
         index = synthetic_index()
