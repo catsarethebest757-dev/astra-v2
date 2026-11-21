@@ -141,7 +141,12 @@ def load_engine(directory: Path, progress=log) -> Engine:
     ranker_path = directory / "model" / "ranker.npz"
     model_meta = directory / "model" / "meta.json"
     enabled = load_json(directory / "model", "meta").get("ranker_enabled", True) if model_meta.exists() else True
-    ranker = load_ranker(ranker_path) if ranker_path.exists() and enabled else None
+    ranker = None
+    if ranker_path.exists() and enabled:
+        try:
+            ranker = load_ranker(ranker_path)
+        except ValueError as error:
+            progress(f"Stage 4/4: {error} Using the heuristic scorer until then.")
     if ranker_path.exists() and not enabled:
         progress("Stage 4/4: using the heuristic scorer selected by held-out evaluation")
     engine = Engine(index, ranker, encoder_name=encoder_name)
@@ -183,8 +188,12 @@ def prepare(directory: Path, config: BuildConfig | None = None, progress=log, tr
     else:
         progress("Stage 2/4: feature index already built")
     if train and not (directory / "model" / "ranker.npz").exists():
-        progress("Stage 3/4: training the taste adapter and listwise ranker")
-        train_models(directory, config, progress=progress)
+        imported = load_json(directory / "index", "meta").get("encoder") == "imported"
+        if imported and len(_load_index(directory)[0].all_edges()) < 8:
+            progress("Stage 3/4: no recommendation pairs were imported; using the heuristic scorer")
+        else:
+            progress("Stage 3/4: training the taste adapter and listwise ranker")
+            train_models(directory, config, progress=progress)
     else:
         progress("Stage 3/4: model already on disk" if (directory / "model" / "ranker.npz").exists()
                  else "Stage 3/4: training skipped")
