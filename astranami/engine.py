@@ -10,11 +10,24 @@ import numpy as np
 from .config import ASPECTS, SOURCES
 from .features.text import MOOD_TAGS, top_tags
 from .index import Index, dense_scores, top_k
-from .learn.features import FEATURES, candidate_pool, pair_features
+from .learn.features import FEATURES, candidate_channels, pair_features
 from .learn.ranker import HEURISTIC, Ranker, heuristic_scores
 from .util import log, norm
 
 WEIGHTS = ("plot", "themes", "tone", "creators")
+POOL_SIZES = {"adapter": 280, "whole": 140, "themes": 80, "graph": 50, "bm25": 50}
+POOL_LIMIT = 1500
+# Every seed's scores are standardized over the candidate pool, so these strengths mean the same thing
+# for the heuristic scorer and for a trained ranker whose raw outputs have an arbitrary scale.
+SEED_TEMPERATURE = 0.5
+CONSENSUS_BONUS = 0.25
+CONSENSUS_DEPTH = 40
+QUERY_BLEND = 0.45
+QUALITY_BONUS = 0.5
+HIDDEN_GEM_PENALTY = 4.0
+DISLIKE_PENALTY = 2.6
+ENTRY_TOLERANCE = 0.25
+SEED_BALANCE = 0.3
 REASON = {
     "cos_plot": "plot matches",
     "cos_themes": "themes match",
@@ -38,6 +51,19 @@ def _trigrams(text: str) -> list[str]:
     return [padded[index:index + 3] for index in range(max(len(padded) - 2, 0))]
 
 
+def _standardize(scores: np.ndarray) -> np.ndarray:
+    """Zero mean and unit spread over the finite entries; a flat pool becomes all zeros."""
+    scores = np.asarray(scores, dtype=np.float32)
+    finite = np.isfinite(scores)
+    if not finite.any():
+        return np.zeros_like(scores)
+    center = float(scores[finite].mean())
+    spread = float(scores[finite].std())
+    output = (scores - center) / spread if spread > 1e-6 else scores - center
+    output[~finite] = -np.inf
+    return output
+
+
 def _number(value, minimum, maximum, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"{label} must be a finite number.")
@@ -55,6 +81,7 @@ class Engine:
         self._grams: dict[str, list[int]] = defaultdict(list)
         self._exact: dict[str, set[int]] = defaultdict(set)
         self._names: list[list[str]] = []
+        self._labels: dict[str, np.ndarray] | None = None
         for position, record in enumerate(index.records):
             names = []
             for value in (record["title"], *record["aliases"]):
@@ -113,10 +140,10 @@ class Engine:
         mask = self._mask(parsed)
         qvec = self._encode_query(parsed["query"]) if parsed["query"] else None
         ranked = self._rank(parsed["liked"], parsed["query"], qvec, mask, parsed)
-        results = [self._card(item, parsed["query"]) for item in ranked]
+        results = [self._card(item, parsed, qvec) for item in ranked]
         message = "Rank scores are relative, not match probabilities."
-        if len(parsed["liked"]) > 24:
-            message = "Used the first 24 liked titles for retrieval. " + message
+        if parsed["liked_total"] > len(parsed["liked"]):
+            message = f"Used the first {len(parsed['liked'])} liked titles for retrieval. " + message
         if not results:
             message = "No matches. Try broader terms or fewer filters."
         return {"results": results, "message": message}
@@ -127,6 +154,7 @@ class Engine:
         mask[seed] = False
         parsed = {
             "weights": {name: 1.0 for name in WEIGHTS}, "hidden_gems": 0.0, "diversity": 0.0, "limit": limit,
+            "explain": False,
         }
         return [item["id"] for item in self._rank([seed], "", None, mask, parsed)]
 
@@ -166,7 +194,7 @@ class Engine:
             raise ValueError("year_min cannot exceed year_max.")
         min_rating = _number(request.get("min_rating", 0), 0, 10, "min_rating")
         hidden_gems = _number(request.get("hidden_gems", 0), 0, 1, "hidden_gems")
-        for field in ("allow_adult", "cross_format"):
+        for field in ("allow_adult", "cross_format", "explain"):
             if field in request and not isinstance(request[field], bool):
                 raise ValueError(f"{field} must be a boolean.")
         weights = {name: 1.0 for name in WEIGHTS}
@@ -177,7 +205,8 @@ class Engine:
             if name in supplied:
                 weights[name] = _number(supplied[name], 0, 3, f"aspect_weights.{name}")
         return {
-            "query": query.strip(), "liked": liked[:24], "disliked": disliked, "seen": seen,
+            "query": query.strip(), "liked": liked[:24], "liked_total": len(liked),
+            "explain": bool(request.get("explain", False)), "disliked": disliked, "seen": seen,
             "exclude_tags": {norm(tag) for tag in selections["exclude_tags"] if norm(tag)},
             "kind": kind, "limit": limit, "diversity": diversity, "year_min": year_min, "year_max": year_max,
             "min_rating": min_rating, "hidden_gems": hidden_gems,
@@ -205,12 +234,21 @@ class Engine:
             liked = np.array(parsed["liked"], dtype=np.int64)
             mask &= ~np.isin(index.franchise, list(set(index.franchise[liked].tolist())))
         if parsed["exclude_tags"]:
-            banned = np.array([
-                bool(parsed["exclude_tags"] & (set(record["tags"]) | set(record["genres"])))
-                for record in index.records
-            ])
-            mask &= ~banned
+            labels = self._label_rows()
+            for name in parsed["exclude_tags"]:
+                if name in labels:
+                    mask[labels[name]] = False
         return mask
+
+    def _label_rows(self) -> dict[str, np.ndarray]:
+        """Tag or genre name -> rows carrying it, built on first use."""
+        if self._labels is None:
+            rows: dict[str, list[int]] = defaultdict(list)
+            for position, record in enumerate(self.index.records):
+                for name in set(record["tags"]) | set(record["genres"]):
+                    rows[name].append(position)
+            self._labels = {name: np.array(positions, dtype=np.int64) for name, positions in rows.items()}
+        return self._labels
 
     def _encode_query(self, text: str):
         try:
@@ -226,26 +264,33 @@ class Engine:
             return None
         return vector
 
-    def _candidates(self, seeds: list[int], query: str, qvec, mask: np.ndarray) -> np.ndarray:
-        pools = []
-        sizes = {"adapter": 280, "whole": 140, "themes": 80, "graph": 50, "bm25": 50}
+    def _candidates(self, seeds: list[int], query: str, qvec, mask: np.ndarray,
+                    lexical: np.ndarray | None = None) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Candidate rows plus the retrieval channels that surfaced them (for the inspector)."""
+        channels: dict[str, list[np.ndarray]] = defaultdict(list)
         for seed in seeds:
-            pools.append(candidate_pool(self.index, seed, mask, sizes=sizes))
+            for name, rows in candidate_channels(self.index, seed, mask, sizes=POOL_SIZES).items():
+                channels[name].append(rows)
         if query:
-            pools.append(top_k(self.index.bm25.query(query), 200, mask))
+            channels["query words"].append(top_k(lexical, 200, mask))
             if qvec is not None:
                 for aspect, count in (("whole", 200), ("themes", 80), ("tone", 40)):
-                    pools.append(top_k(dense_scores(self.index, aspect, qvec), count, mask))
-        pools = [pool for pool in pools if len(pool)]
-        if not pools:
-            return np.zeros(0, dtype=np.int64)
-        candidates = np.unique(np.concatenate(pools))
+                    channels[f"query {aspect}"].append(top_k(dense_scores(self.index, aspect, qvec), count, mask))
+        merged = {name: np.unique(np.concatenate(rows)) for name, rows in channels.items() if sum(map(len, rows))}
+        if not merged:
+            return np.zeros(0, dtype=np.int64), {}
+        candidates = np.unique(np.concatenate(list(merged.values())))
         candidates = candidates[mask[candidates]]
-        if len(candidates) > 1500 and seeds:
-            quick = self.index.dense32("whole")[candidates] @ self.index.dense32("whole")[seeds[0]]
-            keep = np.argpartition(-quick, 1499)[:1500]
-            candidates = candidates[keep]
-        return candidates
+        if len(candidates) > POOL_LIMIT:
+            # Keep the candidates closest to any liked title or to the query, not just to the first seed.
+            whole = self.index.dense32("whole")
+            anchors = [whole[seed] for seed in seeds] + ([qvec] if qvec is not None else [])
+            if anchors:
+                quick = (whole[candidates] @ np.stack(anchors).T).max(axis=1)
+                candidates = np.sort(candidates[np.argpartition(-quick, POOL_LIMIT - 1)[:POOL_LIMIT]])
+            else:
+                candidates = np.sort(candidates[np.argpartition(-lexical[candidates], POOL_LIMIT - 1)[:POOL_LIMIT]])
+        return candidates, merged
 
     def _apply_weights(self, features: np.ndarray, weights: dict) -> np.ndarray:
         scaled = np.array(features, dtype=np.float32, copy=True)
@@ -268,13 +313,15 @@ class Engine:
             return heuristic_scores(features)
         return scores
 
-    def _query_features(self, query: str, qvec, candidates: np.ndarray) -> np.ndarray:
+    def _query_features(self, query: str, qvec, candidates: np.ndarray,
+                        lexical: np.ndarray | None = None) -> np.ndarray:
         features = np.zeros((len(candidates), len(FEATURES)), dtype=np.float32)
         if qvec is not None:
             for aspect in ASPECTS:
                 features[:, FEATURES.index(f"cos_{aspect}")] = self.index.dense32(aspect)[candidates] @ qvec
             features[:, FEATURES.index("cos_adapter")] = features[:, FEATURES.index("cos_whole")]
-        lexical = self.index.bm25.query(query)
+        if lexical is None:
+            lexical = self.index.bm25.query(query)
         features[:, FEATURES.index("bm25")] = np.minimum(lexical[candidates], 2.0)
         folded = f" {norm(query)} "
         columns = [self.index.tags.index[name] for name in self.index.tags.names if f" {name} " in folded]
@@ -287,23 +334,23 @@ class Engine:
         features[:, FEATURES.index("cand_has_synopsis")] = self.index.has_synopsis[candidates]
         return features
 
-    def _aggregate(self, matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _aggregate(self, matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Combine standardized per-seed scores: a sharp soft maximum plus a bonus for agreement.
+
+        The soft maximum lets a candidate win on its best-matching liked title, so one outlying like still
+        gets recommendations. Returns (scores, consensus bonus already included in scores, best seed row).
+        """
         if matrix.shape[0] == 1:
-            return matrix[0], np.zeros(matrix.shape[1], dtype=np.int64)
-        capped = np.where(matrix > -1e3, matrix, -1e4)
-        peak = capped.max(axis=0)
-        gathered = np.exp(np.clip(capped - peak, -40, 0)).sum(axis=0)
-        scores = peak + np.log(np.maximum(gathered, 1e-12))
-        consensus = np.zeros(matrix.shape[1], dtype=np.float32)
-        for row in capped:
-            valid = row > -1e3
-            count = int(valid.sum())
-            if count == 0:
-                continue
-            k = min(40, count)
-            threshold = np.partition(row[valid], -k)[-k]
-            consensus += (row >= threshold) & valid
-        return scores + 0.18 * np.log1p(consensus), capped.argmax(axis=0)
+            return matrix[0], np.zeros(matrix.shape[1], dtype=np.float32), np.zeros(matrix.shape[1], dtype=np.int64)
+        sharp = np.where(np.isfinite(matrix), matrix, -1e4) / SEED_TEMPERATURE
+        peak = sharp.max(axis=0)
+        gathered = np.exp(np.clip(sharp - peak, -40, 0)).mean(axis=0)
+        scores = SEED_TEMPERATURE * (peak + np.log(np.maximum(gathered, 1e-12)))
+        depth = min(CONSENSUS_DEPTH, matrix.shape[1])
+        threshold = np.partition(matrix, -depth, axis=1)[:, -depth][:, None]
+        agreeing = ((matrix >= threshold) & np.isfinite(matrix)).sum(axis=0)
+        bonus = (CONSENSUS_BONUS * np.log(np.maximum(agreeing, 1))).astype(np.float32)
+        return (scores + bonus).astype(np.float32), bonus, sharp.argmax(axis=0)
 
     def _penalize(self, disliked: list[int], candidates: np.ndarray, weights: dict) -> np.ndarray:
         penalty = np.zeros(len(candidates), dtype=np.float32)
@@ -316,41 +363,67 @@ class Engine:
         return penalty / len(disliked)
 
     def _rank(self, seeds: list[int], query: str, qvec, mask: np.ndarray, parsed: dict) -> list[dict]:
-        candidates = self._candidates(seeds, query, qvec, mask)
+        lexical = self.index.bm25.query(query) if query else None
+        candidates, channels = self._candidates(seeds, query, qvec, mask, lexical)
         if len(candidates) == 0:
             return []
-        weights = parsed["weights"]
-        best_seed = np.full(len(candidates), -1, dtype=np.int64)
-        if seeds:
-            matrix = np.full((len(seeds), len(candidates)), -1e4, dtype=np.float32)
-            for row, seed in enumerate(seeds):
-                raw = pair_features(self.index, seed, candidates)
-                matrix[row] = self._score_features(self._apply_weights(raw, weights))
-            scores, which = self._aggregate(matrix)
-            best_seed = np.array([seeds[int(index)] for index in which], dtype=np.int64)
-            if query:
-                query_scores = self._score_features(self._apply_weights(self._query_features(query, qvec, candidates), weights))
-                scores = scores + 0.45 * query_scores
-        else:
-            scores = self._score_features(self._apply_weights(self._query_features(query, qvec, candidates), weights))
-        scores = scores - parsed["hidden_gems"] * self.index.pop[candidates]
-        scores = scores + (1 - parsed["hidden_gems"]) * 0.12 * (self.index.quality[candidates] / 10)
-        scores = scores - 0.65 * self._penalize(parsed.get("disliked", []), candidates, weights)
-        valid = np.isfinite(scores)
-        candidates, scores, best_seed = candidates[valid], scores[valid], best_seed[valid]
-        chosen, chosen_scores, chosen_seeds = self._collapse(candidates, scores, best_seed)
-        ordered = self._mmr(chosen, chosen_scores, parsed["limit"], parsed["diversity"])
-        seed_of = {item: seed for item, seed in zip(chosen, chosen_seeds)}
-        score_of = {item: score for item, score in zip(chosen, chosen_scores)}
-        return [{"id": item, "score": float(score_of[item]), "seed": int(seed_of[item])} for item in ordered]
-
-    def _collapse(self, candidates, scores, seeds):
         index = self.index
-        best_pos = {}
-        entry_pos = {}
-        for position, item in enumerate(candidates):
-            franchise = int(index.franchise[item])
-            if index.entry[item]:
+        weights = parsed["weights"]
+        zeros = np.zeros(len(candidates), dtype=np.float32)
+        parts = {"query": zeros, "agreement": zeros}
+        best_seed = np.full(len(candidates), -1, dtype=np.int64)
+        matrix = None
+        if query:
+            parts["query"] = _standardize(self._score_features(
+                self._apply_weights(self._query_features(query, qvec, candidates, lexical), weights)))
+        if seeds:
+            matrix = np.empty((len(seeds), len(candidates)), dtype=np.float32)
+            for row, seed in enumerate(seeds):
+                raw = pair_features(index, seed, candidates)
+                matrix[row] = _standardize(self._score_features(self._apply_weights(raw, weights)))
+            parts["taste"], parts["agreement"], which = self._aggregate(matrix)
+            parts["taste"] = parts["taste"] - parts["agreement"]
+            best_seed = np.array(seeds, dtype=np.int64)[which]
+            parts["query"] = QUERY_BLEND * parts["query"]
+        parts["quality"] = (1 - parsed["hidden_gems"]) * QUALITY_BONUS * (index.quality[candidates] / 10)
+        parts["hidden_gems"] = -HIDDEN_GEM_PENALTY * parsed["hidden_gems"] * index.pop[candidates]
+        parts["dislikes"] = -DISLIKE_PENALTY * self._penalize(parsed.get("disliked", []), candidates, weights)
+        scores = np.sum([np.asarray(part, dtype=np.float32) for part in parts.values()], axis=0)
+        valid = np.isfinite(scores)
+        picked = self._collapse(candidates, scores, valid)
+        ordered = self._select(candidates[picked], scores[picked], best_seed[picked], parsed["limit"],
+                               parsed["diversity"])
+        ranked = []
+        for place in ordered:
+            column = int(picked[place])
+            item = {"id": int(candidates[column]), "score": float(scores[column]), "seed": int(best_seed[column])}
+            if parsed.get("explain"):
+                row = int(candidates[column])
+                item["inspect"] = {
+                    "rank_before_diversity": int(place) + 1,
+                    "score_parts": {name: round(float(part[column]), 4) for name, part in parts.items()
+                                    if abs(float(part[column])) > 5e-5},
+                    "found_by": sorted(name for name, rows in channels.items()
+                                       if rows[min(int(np.searchsorted(rows, row)), len(rows) - 1)] == row),
+                    "franchise_size": int(np.count_nonzero(index.franchise == index.franchise[row])),
+                    "liked": [] if matrix is None else sorted(
+                        ({"id": index.records[seed]["id"], "title": index.records[seed]["title"],
+                          "score": round(float(matrix[position, column]), 4)}
+                         for position, seed in enumerate(seeds) if np.isfinite(matrix[position, column])),
+                        key=lambda entry: -entry["score"])[:8],
+                }
+            ranked.append(item)
+        return ranked
+
+    def _collapse(self, candidates: np.ndarray, scores: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        """One candidate per franchise, best first: the entry point when it scores close to the best member."""
+        index = self.index
+        best_pos: dict[int, int] = {}
+        entry_pos: dict[int, int] = {}
+        for position in np.flatnonzero(valid):
+            position = int(position)
+            franchise = int(index.franchise[candidates[position]])
+            if index.entry[candidates[position]]:
                 entry_pos[franchise] = position
             current = best_pos.get(franchise)
             if current is None or scores[position] > scores[current]:
@@ -358,30 +431,48 @@ class Engine:
         picked = []
         for franchise, position in best_pos.items():
             entry = entry_pos.get(franchise)
-            if entry is not None and scores[entry] >= 0.9 * max(scores[position], 1e-6):
+            if entry is not None and scores[entry] >= scores[position] - ENTRY_TOLERANCE:
                 position = entry
             picked.append(position)
         picked.sort(key=lambda position: (-scores[position], int(candidates[position])))
-        return (candidates[picked], scores[picked], seeds[picked])
+        return np.array(picked, dtype=np.int64)
 
-    def _mmr(self, ids, scores, limit: int, diversity: float) -> list[int]:
-        if len(ids) == 0:
-            return []
-        if diversity <= 0 or len(ids) == 1:
-            order = np.lexsort((ids, -scores))
-            return [int(ids[index]) for index in order[:limit]]
-        vectors = self.index.adapter[ids] if self.index.adapter is not None else self.index.dense32("whole")[ids]
-        vectors = np.asarray(vectors, dtype=np.float32)
+    def _select(self, ids: np.ndarray, scores: np.ndarray, seeds: np.ndarray, limit: int,
+                diversity: float) -> list[int]:
+        """Positions into `ids` (already sorted best first), greedily traded off against redundancy.
+
+        With several liked titles, each one also gets a fair share of the list: a candidate whose
+        best-matching liked title already filled its share is pushed down, so one outlying like is not
+        crowded out by a cluster of similar likes.
+        """
+        count = min(limit, len(ids))
+        liked = np.unique(seeds[seeds >= 0])
+        if len(ids) <= 1 or (diversity <= 0 and len(liked) <= 1):
+            return list(range(count))
+        # Work within a shortlist, with scores rescaled to 0-1 so the trade-offs are comparable to a cosine.
+        window = min(len(ids), max(5 * limit, 50))
+        shortlist = min(len(ids), window * max(len(liked), 1))
+        top = scores[:shortlist].astype(np.float32)
+        span = float(top[0] - top[window - 1])
+        live = (top - top[window - 1]) / span if span > 1e-6 else np.ones(shortlist, dtype=np.float32)
+        redundant = np.zeros(shortlist, dtype=np.float32)
+        if diversity > 0:
+            source = self.index.adapter if self.index.adapter is not None else self.index.dense32("whole")
+            vectors = np.asarray(source[ids[:shortlist]], dtype=np.float32)
+        owner = seeds[:shortlist]
+        share = max(1, int(np.ceil(count / max(len(liked), 1))))
+        filled: Counter = Counter()
         selected = []
-        live = scores.astype(np.float32).copy()
-        redundant = np.zeros(len(ids), dtype=np.float32)
-        for _ in range(min(limit, len(ids))):
-            objective = (1 - diversity) * live - diversity * redundant
+        for _ in range(count):
+            crowded = np.array([max(0, filled[int(seed)] + 1 - share) for seed in owner], dtype=np.float32)
+            objective = (1 - diversity) * live - diversity * redundant - SEED_BALANCE * crowded
             pick = int(np.argmax(objective))
             if not np.isfinite(objective[pick]):
                 break
-            selected.append(int(ids[pick]))
-            redundant = np.maximum(redundant, vectors @ vectors[pick])
+            selected.append(pick)
+            filled[int(owner[pick])] += 1
+            if diversity > 0:
+                redundant = np.maximum(redundant, vectors @ vectors[pick])
             live[pick] = -np.inf
         return selected
 
@@ -394,17 +485,17 @@ class Engine:
             "tags": top_tags(record, 12) or list(record["genres"][:6]),
         }
 
-    def _card(self, ranked: dict, query: str) -> dict:
+    def _card(self, ranked: dict, parsed: dict, qvec=None) -> dict:
         position = int(ranked["id"])
         seed = int(ranked["seed"])
+        query = parsed["query"]
         card = self._brief(position)
         card["score"] = round(float(ranked["score"]), 4)
         if seed >= 0:
             raw = pair_features(self.index, seed, np.array([position]))
         else:
-            qvec = self._encode_query(query) if query else None
             raw = self._query_features(query, qvec, np.array([position]))
-        weighted = self._apply_weights(raw, {name: 1.0 for name in WEIGHTS})
+        weighted = self._apply_weights(raw, parsed["weights"])
         if self.ranker is not None:
             attribution = self.ranker.attribute(weighted)[0]
         else:
@@ -418,11 +509,22 @@ class Engine:
         card["reasons"] = reasons
         card["shared_tags"] = shared
         card["explanation"] = " · ".join(reasons)
+        if seed >= 0:
+            card["because"] = {"id": self.index.records[seed]["id"], "title": self.index.records[seed]["title"]}
         order = np.argsort(-attribution)
         card["signals"] = {
             FEATURES[int(column)]: round(float(attribution[int(column)]), 4)
             for column in order[:6] if attribution[int(column)] > 0
         }
+        if "inspect" in ranked:
+            inspect = dict(ranked["inspect"])
+            inspect["scorer"] = "ranker" if self.ranker is not None else "heuristic"
+            inspect["features"] = [
+                {"name": FEATURES[int(column)], "label": REASON.get(FEATURES[int(column)], FEATURES[int(column)]),
+                 "value": round(float(raw[0, int(column)]), 4), "contribution": round(float(attribution[int(column)]), 4)}
+                for column in np.argsort(-np.abs(attribution)) if abs(float(attribution[int(column)])) > 5e-5
+            ]
+            card["inspect"] = inspect
         return card
 
     def _reasons(self, position: int, seed: int, query: str, raw: np.ndarray, attribution: np.ndarray):

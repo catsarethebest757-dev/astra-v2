@@ -1,4 +1,4 @@
-"""Command line: bootstrap, build, train, evaluate, serve, similar, search, self-test."""
+"""Command line: bootstrap, build, train, evaluate, serve, similar, search, compare-index, self-test."""
 from __future__ import annotations
 
 import argparse
@@ -6,6 +6,7 @@ import json
 import sys
 import unittest
 
+from .compare import compare_formats
 from .config import DATA_DIR, BuildConfig
 from .pipeline import bootstrap, build_features, evaluate_saved, load_engine, prepare, train_models
 from .server import serve
@@ -47,12 +48,19 @@ def main(argv: list[str] | None = None) -> int:
     prepare_cmd.add_argument("--port", type=int, default=8765)
 
     similar = commands.add_parser("similar", parents=[common], help="Rank titles similar to one id")
-    similar.add_argument("--id", required=True)
+    similar.add_argument("--id", required=True, action="append", help="Liked title id; repeat for several")
+    similar.add_argument("--query", default="", help="Optional mood or plot description")
     similar.add_argument("--limit", type=int, default=12)
+    similar.add_argument("--explain", action="store_true", help="Include the score breakdown for each result")
 
     search = commands.add_parser("search", parents=[common], help="Search titles")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=12)
+
+    compare = commands.add_parser("compare-index", parents=[common],
+                                  help="Measure what smaller vector formats would cost in neighbor quality")
+    compare.add_argument("--samples", type=int, default=300)
+    compare.add_argument("--k", type=int, default=20)
 
     commands.add_parser("self-test", parents=[common], help="Run the unit tests")
 
@@ -74,11 +82,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "prepare-serve":
             serve(engine, args.port)
     elif args.command == "similar":
-        payload = load_engine(directory).recommend({"liked": [args.id], "limit": args.limit})
+        payload = load_engine(directory).recommend(
+            {"liked": args.id, "query": args.query, "limit": args.limit, "explain": args.explain})
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, allow_nan=False)
         sys.stdout.write("\n")
     elif args.command == "search":
         payload = load_engine(directory).lookup(args.query, limit=args.limit)
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, allow_nan=False)
+        sys.stdout.write("\n")
+    elif args.command == "compare-index":
+        payload = compare_formats(load_engine(directory).index, samples=args.samples, k=args.k)
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, allow_nan=False)
         sys.stdout.write("\n")
     elif args.command == "self-test":

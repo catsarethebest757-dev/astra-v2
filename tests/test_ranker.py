@@ -18,6 +18,8 @@ from astranami.learn.adapter import train_adapter
 from astranami.learn.pairs import make_split
 from astranami.learn.ranker import RankerNet, approx_ndcg_loss, train_ranker
 from astranami.server import serve
+from astranami.compare import compare_formats
+from tests.synthetic import cluster_of, synthetic_index
 
 
 def toy_index() -> Index:
@@ -173,6 +175,70 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(graph.embedding.shape, (100, 8))
         self.assertTrue(np.isfinite(graph.embedding).all())
         self.assertTrue(np.linalg.norm(graph.embedding, axis=1).min() > 0.9)
+
+
+class SyntheticTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.index = synthetic_index()
+        cls.engine = Engine(cls.index)
+        cls.ids = [record["id"] for record in cls.index.records]
+
+    def clusters(self, payload):
+        return [cluster_of(self.index, item["id"]) for item in payload["results"]]
+
+    def test_single_seed_stays_in_its_cluster(self):
+        payload = self.engine.recommend({"liked": [self.ids[3]], "limit": 10, "diversity": 0})
+        self.assertGreaterEqual(self.clusters(payload).count(0), 8)
+
+    def test_outlying_like_is_not_crowded_out(self):
+        liked = [self.ids[0], self.ids[5], self.ids[9], self.ids[25 * 7 + 2]]
+        payload = self.engine.recommend({"liked": liked, "limit": 12})
+        found = self.clusters(payload)
+        self.assertGreaterEqual(found.count(7), 2)
+        self.assertGreater(found.count(0), found.count(7))
+        self.assertIn(payload["results"][0]["because"]["id"], liked)
+
+    def test_query_is_encoded_once(self):
+        calls = []
+        vector = self.index.dense32("whole")[40]
+
+        def encode(text):
+            calls.append(text)
+            return vector
+
+        self.engine._encode_query = encode
+        try:
+            payload = self.engine.recommend({"query": "word6 word7 word8", "limit": 10})
+        finally:
+            del self.engine._encode_query
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.clusters(payload)[0], 1)
+
+    def test_inspector_accounts_for_the_score(self):
+        plain = self.engine.recommend({"liked": [self.ids[30]], "limit": 5})
+        self.assertNotIn("inspect", plain["results"][0])
+        payload = self.engine.recommend({"liked": [self.ids[30], self.ids[60]], "limit": 5, "explain": True})
+        json.dumps(payload, allow_nan=False)
+        for item in payload["results"]:
+            inspect = item["inspect"]
+            self.assertAlmostEqual(sum(inspect["score_parts"].values()), item["score"], delta=0.01)
+            self.assertTrue(inspect["found_by"])
+            self.assertTrue(inspect["features"])
+            self.assertTrue(inspect["liked"])
+
+    def test_excluded_tag_is_removed(self):
+        payload = self.engine.recommend({"liked": [self.ids[3]], "limit": 10, "exclude_tags": ["tag0", "no such tag"]})
+        self.assertTrue(payload["results"])
+        for item in payload["results"]:
+            self.assertNotIn("tag0", self.index.records[self.index.ids[item["id"]]]["tags"])
+
+    def test_format_comparison(self):
+        report = compare_formats(self.index, samples=40, k=10)
+        whole = report["aspects"]["whole"]
+        self.assertGreater(whole["float16"]["recall"], 0.95)
+        self.assertGreaterEqual(whole["int8"]["recall"], whole["binary"]["recall"])
+        self.assertLess(whole["binary"]["megabytes"], whole["int8"]["megabytes"])
 
 
 class TrainingSmoke(unittest.TestCase):

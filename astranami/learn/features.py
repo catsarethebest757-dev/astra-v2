@@ -22,8 +22,8 @@ def pair_features(index: Index, seed: int, candidates: np.ndarray, use_graph: bo
     if not len(candidates):
         return output
     for aspect, column in ASPECT_FEATURES.items():
-        matrix = index.aspects[aspect]
-        output[:, column] = matrix[candidates].astype(np.float32) @ matrix[seed].astype(np.float32)
+        matrix = index.dense32(aspect)
+        output[:, column] = matrix[candidates] @ matrix[seed]
     if index.adapter is not None:
         output[:, 4] = index.adapter[candidates] @ index.adapter[seed]
     output[:, 5] = np.minimum(index.bm25.item_scores(seed, candidates), 2.0)
@@ -40,19 +40,29 @@ def pair_features(index: Index, seed: int, candidates: np.ndarray, use_graph: bo
     return output
 
 
+DEFAULT_POOL = {"adapter": 300, "whole": 120, "themes": 80, "graph": 60, "bm25": 60}
+
+
+def candidate_channels(index: Index, seed: int, eligible: np.ndarray, sizes: dict | None = None,
+                       use_graph: bool = True) -> dict[str, np.ndarray]:
+    """The strongest neighbors of a seed under each retrieval view, keyed by view name."""
+    sizes = sizes or DEFAULT_POOL
+    mask = eligible.copy()
+    mask[seed] = False
+    channels = {}
+    if index.adapter is not None:
+        channels["adapter"] = top_k(adapter_scores(index, seed), sizes["adapter"], mask)
+    for aspect in ("whole", "themes"):
+        channels[aspect] = top_k(dense_scores(index, aspect, index.dense32(aspect)[seed]), sizes[aspect], mask)
+    if use_graph and index.graph is not None:
+        neighbors = index.graph.neighbors(seed, sizes["graph"] * 2)
+        channels["graph"] = neighbors[mask[neighbors]][:sizes["graph"]]
+    channels["bm25"] = top_k(index.bm25.item_scores(seed), sizes["bm25"], mask)
+    return channels
+
+
 def candidate_pool(index: Index, seed: int, eligible: np.ndarray, sizes: dict | None = None,
                    use_graph: bool = True) -> np.ndarray:
     """Union of the strongest neighbors under several views; the ranker then orders this pool."""
-    sizes = sizes or {"adapter": 300, "whole": 120, "themes": 80, "graph": 60, "bm25": 60}
-    mask = eligible.copy()
-    mask[seed] = False
-    pools = []
-    if index.adapter is not None:
-        pools.append(top_k(adapter_scores(index, seed), sizes["adapter"], mask))
-    for aspect in ("whole", "themes"):
-        pools.append(top_k(dense_scores(index, aspect, index.aspects[aspect][seed]), sizes[aspect], mask))
-    if use_graph and index.graph is not None:
-        neighbors = index.graph.neighbors(seed, sizes["graph"] * 2)
-        pools.append(neighbors[mask[neighbors]][:sizes["graph"]])
-    pools.append(top_k(index.bm25.item_scores(seed), sizes["bm25"], mask))
+    pools = list(candidate_channels(index, seed, eligible, sizes, use_graph).values())
     return np.unique(np.concatenate(pools)) if pools else np.zeros(0, dtype=np.int64)

@@ -109,12 +109,19 @@ class BM25:
     def query(self, text: str) -> np.ndarray:
         counts = Counter(tokens(text))
         normalized = f" {norm(text)} "
-        for token in self.vocabulary:
-            if token.startswith("tag:") and f" {token[4:]} " in normalized:
+        for token, phrase in self._tag_terms():
+            if phrase in normalized:
                 counts[token] += 3
         vector = self.counts([counts])
         vector.data[:] = 1.0
         return np.asarray((self.matrix @ vector.T).todense()).ravel()
+
+    def _tag_terms(self) -> list[tuple[str, str]]:
+        terms = getattr(self, "_tag_term_cache", None)
+        if terms is None:
+            terms = self._tag_term_cache = [(token, f" {token[4:]} ") for token in self.vocabulary
+                                            if token.startswith("tag:")]
+        return terms
 
     def item_query(self, index: int, top_terms: int = 60) -> sparse.csr_matrix:
         """Seed document as a query: its highest-weighted terms."""
