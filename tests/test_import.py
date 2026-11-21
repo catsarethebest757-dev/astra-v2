@@ -28,7 +28,7 @@ def export(folder: Path, clusters: int = 6, per_cluster: int = 12, width: int = 
             titles.append({
                 "id": identifier, "media": "anime" if cluster % 2 else "movie", "name": f"Title {cluster}-{member}",
                 "year": 2000 + member, "format": "TV", "genres": [f"genre{cluster}"],
-                "tags": {own[0].upper(): 0.9, own[1]: 0.6}, "synopsis": " ".join(own * 3) + f" unique{member}",
+                "tags": {own[0].upper(): 0.9, own[0]: 0.1, own[1]: 0.6}, "synopsis": " ".join(own * 3) + f" unique{member}",
                 "score": 60 + member, "popularity": 100 * (member + 1), "episodes": 12,
             })
             keys.append(identifier)
@@ -64,10 +64,10 @@ class ImportTests(unittest.TestCase):
             (data / "model" / "ranker.npz").write_bytes(b"stale")
             built = import_catalog(data, folder / "titles.jsonl", folder / "keys.json", folder / "vectors.npy",
                                    folder / "training", progress=quiet)
-            self.assertFalse((data / "model").exists())
+            self.assertFalse((data / "model" / "ranker.npz").exists())
             self.assertEqual(built.size, len(made["keys"]))
             self.assertEqual(built.records[built.ids["tmdb:0"]]["url"], "https://www.themoviedb.org/tv/0")
-            self.assertIn("word0", built.records[built.ids["tmdb:1"]]["tags"])
+            self.assertEqual(built.records[built.ids["tmdb:1"]]["tags"]["word0"], 0.9)
             self.assertEqual(len({built.aspects[aspect].shape[1] for aspect in built.aspects}), 1)
             index = Index.load(load_json(data, "catalog"), data / "index")
             self.assertEqual(index.size, built.size)

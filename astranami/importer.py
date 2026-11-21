@@ -13,7 +13,6 @@ from __future__ import annotations
 import gzip
 import json
 import re
-import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -34,6 +33,7 @@ NOTE_PATTERN = re.compile(r"^(%s): (.*)$" % "|".join(NOTE_LINES), re.M)
 SOURCE_URL = {"anilist": "https://anilist.co/anime/{}", "mal": "https://myanimelist.net/anime/{}",
               "tvmaze": "https://www.tvmaze.com/shows/{}", "tmdb": "https://www.themoviedb.org/movie/{}"}
 ASPECT_WIDTH = 192
+MODEL_FILES = ("ranker.npz", "ranker-heldout.npz", "adapter-heldout.npy", "meta.json")
 
 
 def _lines(path: Path):
@@ -60,12 +60,15 @@ def _record(row: dict) -> dict:
     source, _, number = identifier.partition(":")
     names = [name for name in [row.get("original") or "", *(row.get("alt") or [])] if name and name != row["name"]]
     score = float(row.get("score") or 0)
+    tags: dict[str, float] = {}
+    for name, weight in (row.get("tags") or {}).items():
+        if norm(name):
+            tags[norm(name)] = max(tags.get(norm(name), 0.0), float(min(max(weight, 0.0), 1.0)))
     return blank(
         identifier, row["name"], MEDIA[row["media"]], aliases=names, year=int(row.get("year") or 0),
         synopsis=row.get("synopsis") or "",
         genres=sorted({norm(genre) for genre in row.get("genres") or [] if norm(genre)}),
-        tags={norm(name): float(min(max(weight, 0.0), 1.0)) for name, weight in (row.get("tags") or {}).items()
-              if norm(name)},
+        tags=tags,
         studios=list(row.get("studios") or []), source=source, format=(row.get("format") or "").upper(),
         episodes=int(row.get("episodes") or 0), runtime=int(row.get("runtime") or 0),
         country=row.get("country") or "", language=row.get("language") or "",
@@ -192,7 +195,8 @@ def import_catalog(directory: Path, titles: Path, keys: Path, vectors: Path, tra
     })
     # Models trained on whatever catalog was here before describe different titles.
     (directory / "index" / "adapter.npy").unlink(missing_ok=True)
-    shutil.rmtree(directory / "model", ignore_errors=True)
+    for name in MODEL_FILES:
+        (directory / "model" / name).unlink(missing_ok=True)
     index.save(directory / "index")
     save_json(directory / "index", "meta", {"encoder": "imported", "catalog": sha("\n".join(r["id"] for r in records))})
     progress(f"Import: saved {index.size:,} titles.")
