@@ -150,7 +150,7 @@ def _training_lists(index: Index, seeds: np.ndarray, label_edges: dict, list_siz
         # Fan recommendations are sparse, so a close neighbor without one is usually a good match nobody
         # has written down yet. Lists built from near neighbors teach the ranker that similarity is a bad
         # sign (measured on a 118k-title catalog), so every negative is a random title.
-        negative = usable(rng.integers(0, index.size, size=room * 2))[:room]
+        negative = rng.permutation(usable(rng.integers(0, index.size, size=room * 2)))[:room]
         if not len(negative):
             continue
         keep = np.concatenate([positive, negative])
